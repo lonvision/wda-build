@@ -1,6 +1,12 @@
 # 用途：在 GitHub 的 macOS 机器上编译 WebDriverAgent，产出可交给「巨魔」安装的 ipa
 # 位置：仓库根目录下的 .github/workflows/build-wda.yml（注意前面有一个点）
 # 触发：仓库 → Actions → 左侧 build-wda → 右侧 Run workflow
+#
+# === v2 相比 v1 只改了一处：打包阶段先清掉 Apple 平台框架原有的签名、并裁成 arm64 单架构 ===
+# 原因：装出 175（ldid 签名返回非零）时，最可疑的是从 Xcode 平台目录搬进来的
+#       XCTest / XCTAutomationSupport / XCUIAutomation —— 它们是苹果签过的、常常是 arm64e 的多架构二进制，
+#       ldid 重新签名时最容易在这类"外来二进制"上翻车。先 remove-signature + 瘦身，等于把它变成
+#       一个干净、单架构、无签名的普通 Mach-O 再交给巨魔。
 name: build-wda
 
 on:
@@ -61,7 +67,7 @@ jobs:
             DEVELOPMENT_TEAM="" \
             2>&1 | tail -100
 
-      - name: 5. 打包：补 XCTest 运行库 → 改加载路径 → ad-hoc 重签 → 压 ipa
+      - name: 5. 打包：补 XCTest 运行库 → 清理签名并瘦身 → 改路径 → 重签 → 压 ipa
         run: |
           set -e
           APP=$(find "$RUNNER_TEMP/dd" -name "WebDriverAgentRunner-Runner.app" -type d | head -1)
@@ -92,7 +98,33 @@ jobs:
           cp "$PLAT/usr/lib/libXCTestBundleInject.dylib" "$APP/Frameworks/" 2>/dev/null \
             && echo "  + libXCTestBundleInject.dylib" || true
 
-          # ── 5.2 把写死的 /Developer/... 绝对路径改成 @rpath ──
+          # ── 5.2 【v2 新增】清掉原有的苹果签名，并把多架构裁成 arm64 ──
+          # 目的：交给巨魔一个"干净的无签名单架构 Mach-O"，避开 ldid 在 arm64e/多架构上出错。
+          strip_and_thin() {
+            b="$1"
+            [ -f "$b" ] || return 0
+            echo "--- $b"
+            lipo -info "$b" 2>/dev/null || file "$b"
+            codesign --remove-signature "$b" >/dev/null 2>&1 || true
+            if lipo -info "$b" 2>/dev/null | grep -q "Architectures in the fat file"; then
+              if lipo -thin arm64 "$b" -output "$b.arm64" 2>/dev/null; then
+                mv "$b.arm64" "$b"
+                echo "    -> 已裁成 arm64 单架构"
+              else
+                rm -f "$b.arm64"
+                echo "    -> 无 arm64 切片，保持原样"
+              fi
+            fi
+          }
+          for fw in XCTest XCTAutomationSupport XCUIAutomation; do
+            strip_and_thin "$APP/Frameworks/$fw.framework/$fw"
+          done
+          strip_and_thin "$APP/Frameworks/libXCTestBundleInject.dylib"
+          while IFS= read -r -d '' x; do
+            strip_and_thin "$x/$(basename "$x" .xctest)"
+          done < <(find "$APP" -name "*.xctest" -type d -print0)
+
+          # ── 5.3 把写死的 /Developer/... 绝对路径改成 @rpath ──
           ABS_XCTEST="/Developer/Library/Frameworks/XCTest.framework/XCTest"
           ABS_XAS="/Developer/Library/PrivateFrameworks/XCTAutomationSupport.framework/XCTAutomationSupport"
           ABS_XCUI="/Developer/Library/PrivateFrameworks/XCUIAutomation.framework/XCUIAutomation"
@@ -120,8 +152,9 @@ jobs:
           echo "--- Runner 依赖库 ---"; otool -L "$BIN" | head -20
           echo "--- rpath ---";        otool -l "$BIN" | grep -A2 LC_RPATH | head -20
 
-          # ── 5.3 ad-hoc 重签：先内层后外层 ──
+          # ── 5.4 ad-hoc 重签：先内层后外层 ──
           # 这几个 entitlement 决定 WDA 能否操作别的 App；巨魔靠 CoreTrust 放行未签名包。
+          # 注意：巨魔安装时会"继承"这里的 entitlements 再重签一次，所以这一步不能省。
           cat > "$RUNNER_TEMP/ent.plist" <<'PLIST'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -144,7 +177,7 @@ jobs:
           echo "--- 签名检查 ---"
           codesign -dv --entitlements - "$APP" 2>&1 | head -30 || true
 
-          # ── 5.4 压 ipa：必须是 Payload/xxx.app 结构 ──
+          # ── 5.5 压 ipa：必须是 Payload/xxx.app 结构 ──
           mkdir -p "$RUNNER_TEMP/Payload"
           rm -rf "$RUNNER_TEMP/Payload/"*.app
           cp -R "$APP" "$RUNNER_TEMP/Payload/"
@@ -152,8 +185,8 @@ jobs:
           rm -f WebDriverAgent.ipa
           zip -qry WebDriverAgent.ipa Payload
           ls -lh WebDriverAgent.ipa
-          echo "--- ipa 内部结构（Frameworks/ 必须在）---"
-          unzip -l WebDriverAgent.ipa | grep -E "Frameworks/|Runner.app/$|Info.plist" | head -20
+          echo "--- ipa 内部结构（Frameworks/ 必须在，不能有 __MACOSX）---"
+          unzip -l WebDriverAgent.ipa | grep -E "Frameworks/|Runner.app/$|Info.plist|__MACOSX" | head -25
 
       - name: 6. 上传 ipa 成品
         uses: actions/upload-artifact@v4
