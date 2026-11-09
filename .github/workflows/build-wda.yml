@@ -98,6 +98,17 @@ jobs:
           cp "$PLAT/usr/lib/libXCTestBundleInject.dylib" "$APP/Frameworks/" 2>/dev/null \
             && echo "  + libXCTestBundleInject.dylib" || true
 
+          # ── 5.1b 【v4 新增】清掉 dSYM 等"带 Mach-O 但不是运行时代码"的垃圾 ──
+          # 报 175 的直接元凶就是它：
+          #   PlugIns/WebDriverAgentRunner.xctest.dSYM/Contents/Resources/DWARF/WebDriverAgentRunner
+          # 那个文件是调试符号，filetype = MH_DSYM(10)，ldid 白名单里没有 → exit(1) → 175。
+          # dSYM 只用来把崩溃地址还原成函数名，装在手机上毫无作用，纯粹是体积和麻烦。
+          echo "--- 清理 dSYM / 调试符号 ---"
+          find "$APP" -name "*.dSYM" -type d -print -exec rm -rf {} + 2>/dev/null || true
+          find "$APP" \( -name "*.o" -o -name "*.d" -o -name "*.dia" -o -name "*.swiftmodule" \) \
+            -type f -print -delete 2>/dev/null || true
+          echo "剩余 dSYM 数量: $(find "$APP" -name '*.dSYM' 2>/dev/null | wc -l | tr -d ' ')"
+
           # ── 5.2 【v2 新增】清掉原有的苹果签名，并把多架构裁成 arm64 ──
           # 目的：交给巨魔一个"干净的无签名单架构 Mach-O"，避开 ldid 在 arm64e/多架构上出错。
           strip_and_thin() {
@@ -184,7 +195,7 @@ jobs:
           # 就打印 "ldid: Unsupported Mach-O type" 然后 exit(1) → 巨魔报 175。
           # 这里提前把类型全打出来，有问题就让 CI 直接红，不用等你装到手机上才发现。
           python3 - "$APP" <<'PYCHECK'
-          import sys, os, struct
+          import sys, os, struct, shutil
 
           ALLOWED = {2: 'MH_EXECUTE', 6: 'MH_DYLIB', 7: 'MH_DYLINKER', 8: 'MH_BUNDLE'}
           TYPES = {1:'MH_OBJECT',2:'MH_EXECUTE',3:'MH_FVMLIB',4:'MH_CORE',5:'MH_PRELOAD',
@@ -229,26 +240,70 @@ jobs:
               return None
 
           root = sys.argv[1]
-          rows = []
-          for dp,_,fns in os.walk(root):
-              for fn in fns:
-                  p = os.path.join(dp,fn)
-                  s = slices(p)
-                  if s is None: continue
-                  rel = os.path.relpath(p, root)
-                  bad = [t for t in s if t not in ALLOWED]
-                  rows.append((rel, [TYPES.get(t,'?'+str(t)) for t in s], bool(bad)))
+          # 这些类型属于"调试/中间产物"，删掉不影响运行，自动清理掉再复查
+          AUTOFIX = {1, 9, 10, 11}          # MH_OBJECT / MH_DYLIB_STUB / MH_DSYM / MH_KEXT_BUNDLE
 
-          print('--- Mach-O 文件类型清单 (%d 个) ---' % len(rows))
+          def scan():
+              out = []
+              for dp,_,fns in os.walk(root):
+                  for fn in fns:
+                      p = os.path.join(dp,fn)
+                      s = slices(p)
+                      if s is None: continue
+                      rel = os.path.relpath(p, root)
+                      bad = [t for t in s if t not in ALLOWED]
+                      out.append((rel, [TYPES.get(t,'?'+str(t)) for t in s],
+                                  [t for t in s if t not in ALLOWED]))
+              return out
+
+          rows = scan()
+          print('--- 第 1 轮：Mach-O 文件类型清单 (%d 个) ---' % len(rows))
           for rel,types,bad in sorted(rows):
               print('  %s %-58s %s' % ('BAD' if bad else 'ok ', rel, ' + '.join(types)))
+
           bads = [r for r in rows if r[2]]
+          removed = []
           if bads:
               print('')
-              print('!!! 下面这些文件会让巨魔在 ldid 阶段报 175，必须处理掉：')
+              print('--- 发现 %d 个非法类型，尝试自动清理 ---' % len(bads))
+              for rel,types,bt in bads:
+                  path = os.path.join(root, rel)
+                  if all(t in AUTOFIX for t in bt):
+                      # 往上找到 .dSYM 这一层整体删掉，否则只删文件
+                      target = path
+                      parts = rel.split(os.sep)
+                      for i,seg in enumerate(parts):
+                          if seg.endswith('.dSYM'):
+                              target = os.path.join(root, *parts[:i+1])
+                              break
+                      try:
+                          if os.path.isdir(target):
+                              shutil.rmtree(target)
+                          else:
+                              os.remove(target)
+                          removed.append((rel, types))
+                          print('  已删除: %s  (%s)' % (rel, ' + '.join(types)))
+                      except OSError as e:
+                          print('  删除失败: %s (%s)' % (rel, e))
+                  else:
+                      print('  无法自动修复: %s  (%s)' % (rel, ' + '.join(types)))
+
+          if removed:
+              print('')
+              rows = scan()
+              print('--- 第 2 轮：清理后复查 (%d 个) ---' % len(rows))
+              for rel,types,bad in sorted(rows):
+                  print('  %s %-58s %s' % ('BAD' if bad else 'ok ', rel, ' + '.join(types)))
+              bads = [r for r in rows if r[2]]
+
+          if bads:
+              print('')
+              print('!!! 下面这些文件会让巨魔在 ldid 阶段报 175，且无法自动修复：')
               for rel,types,_ in bads:
                   print('    %s  ->  %s' % (rel, ' + '.join(types)))
               sys.exit(1)
+
+          print('')
           print('--- 全部类型合法，巨魔应该能签 ---')
           PYCHECK
 
