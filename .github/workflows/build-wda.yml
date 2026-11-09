@@ -177,7 +177,82 @@ jobs:
           echo "--- 签名检查 ---"
           codesign -dv --entitlements - "$APP" 2>&1 | head -30 || true
 
-          # ── 5.5 压 ipa：必须是 Payload/xxx.app 结构 ──
+          # ── 5.5 【v3 新增】自检：列出 app 内所有 Mach-O 的文件类型 ──
+          # 巨魔最后一步执行 `ldid -s <App.app>`，会递归签 app 里每个 Mach-O。
+          # ldid 只接受 MH_EXECUTE(2) / MH_DYLIB(6) / MH_DYLINKER(7) / MH_BUNDLE(8)，
+          # 遇到别的类型（MH_OBJECT=1、MH_DYLIB_STUB=9、MH_DSYM=10、MH_FILESET=12…）
+          # 就打印 "ldid: Unsupported Mach-O type" 然后 exit(1) → 巨魔报 175。
+          # 这里提前把类型全打出来，有问题就让 CI 直接红，不用等你装到手机上才发现。
+          python3 - "$APP" <<'PYCHECK'
+          import sys, os, struct
+
+          ALLOWED = {2: 'MH_EXECUTE', 6: 'MH_DYLIB', 7: 'MH_DYLINKER', 8: 'MH_BUNDLE'}
+          TYPES = {1:'MH_OBJECT',2:'MH_EXECUTE',3:'MH_FVMLIB',4:'MH_CORE',5:'MH_PRELOAD',
+                   6:'MH_DYLIB',7:'MH_DYLINKER',8:'MH_BUNDLE',9:'MH_DYLIB_STUB',
+                   10:'MH_DSYM',11:'MH_KEXT_BUNDLE',12:'MH_FILESET'}
+          MAGIC = {b'\xcf\xfa\xed\xfe':('little',0), b'\xce\xfa\xed\xfe':('little',0),
+                   b'\xfe\xed\xfa\xcf':('big',0),   b'\xfe\xed\xfa\xce':('big',0)}
+          FAT   = {b'\xca\xfe\xba\xbe':('big',32), b'\xbe\xba\xfe\xca':('little',32),
+                   b'\xca\xfe\xba\xbf':('big',64), b'\xbf\xba\xfe\xca':('little',64)}
+
+          def slices(path):
+              try:
+                  if os.path.getsize(path) < 8:
+                      return None
+                  with open(path,'rb') as f:
+                      head = f.read(8)
+              except OSError:
+                  return None
+              if head[:4] in MAGIC:
+                  endian,_ = MAGIC[head[:4]]
+                  with open(path,'rb') as f:
+                      f.seek(12); raw = f.read(4)
+                  if len(raw) < 4: return []
+                  return [struct.unpack('<I' if endian=='little' else '>I', raw)[0]]
+              if head[:4] in FAT:
+                  out=[]
+                  with open(path,'rb') as f:
+                      f.seek(4); n = struct.unpack('<I' if FAT[head[:4]][0]=='little' else '>I', f.read(4))[0]
+                      if n > 50: return None
+                      entry = 32 if FAT[head[:4]][1]==64 else 20
+                      for i in range(n):
+                          f.seek(8+i*entry); ent = f.read(entry)
+                          if len(ent) < entry: break
+                          off = struct.unpack(('<I' if FAT[head[:4]][0]=='little' else '>I'), ent[8:12])[0]
+                          f.seek(off); sh = f.read(4)
+                          if sh not in MAGIC:
+                              out.append(None); continue
+                          endian,_ = MAGIC[sh]
+                          f.seek(off+12); raw = f.read(4)
+                          out.append(struct.unpack('<I' if endian=='little' else '>I', raw)[0] if len(raw)==4 else None)
+                  return out
+              return None
+
+          root = sys.argv[1]
+          rows = []
+          for dp,_,fns in os.walk(root):
+              for fn in fns:
+                  p = os.path.join(dp,fn)
+                  s = slices(p)
+                  if s is None: continue
+                  rel = os.path.relpath(p, root)
+                  bad = [t for t in s if t not in ALLOWED]
+                  rows.append((rel, [TYPES.get(t,'?'+str(t)) for t in s], bool(bad)))
+
+          print('--- Mach-O 文件类型清单 (%d 个) ---' % len(rows))
+          for rel,types,bad in sorted(rows):
+              print('  %s %-58s %s' % ('BAD' if bad else 'ok ', rel, ' + '.join(types)))
+          bads = [r for r in rows if r[2]]
+          if bads:
+              print('')
+              print('!!! 下面这些文件会让巨魔在 ldid 阶段报 175，必须处理掉：')
+              for rel,types,_ in bads:
+                  print('    %s  ->  %s' % (rel, ' + '.join(types)))
+              sys.exit(1)
+          print('--- 全部类型合法，巨魔应该能签 ---')
+          PYCHECK
+
+          # ── 5.6 压 ipa：必须是 Payload/xxx.app 结构 ──
           mkdir -p "$RUNNER_TEMP/Payload"
           rm -rf "$RUNNER_TEMP/Payload/"*.app
           cp -R "$APP" "$RUNNER_TEMP/Payload/"
